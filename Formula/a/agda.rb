@@ -2,7 +2,7 @@ class Agda < Formula
   desc "Dependently typed functional programming language"
   homepage "https://wiki.portal.chalmers.se/agda/"
   license "BSD-3-Clause"
-  revision 1
+  revision 2
 
   stable do
     url "https://github.com/agda/agda/archive/refs/tags/v2.6.4.3-r1.tar.gz"
@@ -10,8 +10,8 @@ class Agda < Formula
     version "2.6.4.3"
 
     resource "stdlib" do
-      url "https://github.com/agda/agda-stdlib/archive/refs/tags/v2.0.tar.gz"
-      sha256 "14eecb83d62495f701e1eb03ffba59a2f767491f728a8ab8c8bb9243331399d8"
+      url "https://github.com/agda/agda-stdlib/archive/refs/tags/v2.1.tar.gz"
+      sha256 "72ca3ea25094efa0439e106f0d949330414232ec4cc5c3c3316e7e70dd06d431"
     end
 
     resource "cubical" do
@@ -28,6 +28,10 @@ class Agda < Formula
       url "https://github.com/agda/agda2hs/archive/refs/tags/v1.2.tar.gz"
       sha256 "e80ffc90ff2ccb3933bf89a39ab16d920a6c7a7461a6d182faa0fb6c0446dbb8"
     end
+
+    # Backport workaround for installing lib with Cabal 3.12
+    # Ref: https://github.com/agda/agda/commit/6bf5b65274348fcf99e20e29ed719fb48780236a
+    patch :DATA
   end
 
   # The regex below is intended to match stable tags like `2.6.3` but not
@@ -75,13 +79,6 @@ class Agda < Formula
   uses_from_macos "ncurses"
   uses_from_macos "zlib"
 
-  # TODO: Remove when lib:Agda install works with latest cabal-install
-  # Ref: https://github.com/agda/agda/issues/7401
-  resource "cabal-install" do
-    url "https://hackage.haskell.org/package/cabal-install-3.10.3.0/cabal-install-3.10.3.0.tar.gz"
-    sha256 "a8e706f0cf30cd91e006ae8b38137aecf65983346f44d0cba4d7a60bbfa3da9e"
-  end
-
   def install
     cabal_args = std_cabal_v2_args.reject { |s| s["installdir"] }
 
@@ -100,12 +97,15 @@ class Agda < Formula
     # relying on the Agda library just installed
     resource("agda2hs").stage "agda2hs-build"
     cd "agda2hs-build" do
-      # TODO: Remove when lib:Agda install works with latest cabal-install
-      resource("cabal-install").stage do
-        system "cabal", "v2-install", *cabal_args, "--installdir=#{buildpath}/agda2hs-build"
-      end
+      # Work around to build agda2hs with GHC 9.10
+      # Issue ref: https://github.com/agda/agda2hs/issues/347
+      inreplace "agda2hs.cabal", /( base .*&&) < 4\.20,/, "\\1 < 4.21,"
 
-      system "./cabal", "--store-dir=#{libexec}", "v2-install", *std_cabal_v2_args
+      # Work around to use patched Agda source code
+      # TODO: Remove when Agda 2.7.0 is released and agda2hs supports it
+      Pathname("cabal.project.local").write "packages: ./agda2hs.cabal ../Agda.cabal"
+
+      system "cabal", "--store-dir=#{libexec}", "v2-install", *std_cabal_v2_args
     end
 
     # generate the standard library's documentation and vim highlighting files
@@ -314,3 +314,113 @@ class Agda < Formula
     assert_equal agda2hsexpect, agda2hsactual
   end
 end
+
+__END__
+diff --git a/Setup.hs b/Setup.hs
+index 5a844cab571043d3a7532d3d8244acf3b401e1a2..ca6d4c8ac927662851737e76aebd8f9c5684941d 100644
+--- a/Setup.hs
++++ b/Setup.hs
+@@ -1,4 +1,4 @@
+-{-# LANGUAGE NondecreasingIndentation #-}
++{-# LANGUAGE ScopedTypeVariables #-}
+ 
+ import Data.List
+ import Data.Maybe
+@@ -18,8 +18,8 @@ import System.Exit
+ import System.IO
+ import System.IO.Error (isDoesNotExistError)
+ 
+-import Control.Monad (forM_, unless)
+-import Control.Exception (bracket, catch, throwIO)
++import Control.Monad
++import Control.Exception
+ 
+ main :: IO ()
+ main = defaultMainWithHooks userhooks
+@@ -44,9 +44,9 @@ copyHook' pd lbi hooks flags = do
+   copyHook simpleUserHooks pd lbi hooks flags
+   unless (skipInterfaces lbi) $ do
+     -- Generate .agdai files.
+-    generateInterfaces pd lbi
++    success <- generateInterfaces pd lbi
+     -- Copy again, now including the .agdai files.
+-    copyHook simpleUserHooks pd' lbi hooks flags
++    when success $ copyHook simpleUserHooks pd' lbi hooks flags
+   where
+   pd' = pd
+     { dataFiles = concatMap (expandAgdaExt pd) $ dataFiles pd
+@@ -89,7 +89,9 @@ toIFile pd file = buildDir </> fileName where
+ skipInterfaces :: LocalBuildInfo -> Bool
+ skipInterfaces lbi = fromPathTemplate (progSuffix lbi) == "-quicker"
+ 
+-generateInterfaces :: PackageDescription -> LocalBuildInfo -> IO ()
++-- | Returns 'True' if call to Agda executes without error.
++--
++generateInterfaces :: PackageDescription -> LocalBuildInfo -> IO Bool
+ generateInterfaces pd lbi = do
+ 
+   -- for debugging, these are examples how you can inspect the flags...
+@@ -121,6 +123,13 @@ generateInterfaces pd lbi = do
+ 
+   -- Type-check all builtin modules (in a single Agda session to take
+   -- advantage of caching).
++  let agdaDirEnvVar = "Agda_datadir"
++  let agdaArgs =
++        [ "--interaction"
++        , "--interaction-exit-on-error"
++        , "-Werror"
++        , "-v0"
++        ]
+   let loadBuiltinCmds = concat
+         [ [ cmd ("Cmd_load " ++ f ++ " []")
+           , cmd "Cmd_no_metas"
+@@ -130,21 +139,40 @@ generateInterfaces pd lbi = do
+         , let f     = show (ddir </> b)
+               cmd c = "IOTCM " ++ f ++ " None Indirect (" ++ c ++ ")"
+         ]
++  let callLines = concat
++        [ [ unwords $ concat
++            [ [ concat [ agdaDirEnvVar, "=", ddir ] ]
++            , [ agda ]
++            , agdaArgs
++            , [ "<<EOF" ]
++            ]
++          ]
++        , loadBuiltinCmds
++        , [ "EOF" ]
++        ]
++  let onIOError (e :: IOException) = False <$ do
++        putStr $ unlines $ concat
++          [ [ "*** Warning!"
++            , "*** Could not generate Agda library interface files."
++            , "*** Reason:"
++            , show e
++            , "*** The attempted call to Agda was:"
++            ]
++          , callLines
++          , [ "*** Ignoring error, continuing installation..." ]
++          ]
+   env <- getEnvironment
+-  _output <- readCreateProcess
+-      (proc agda
+-          [ "--interaction"
+-          , "--interaction-exit-on-error"
+-          , "-Werror"
+-          , "-v0"
+-          ])
++  handle onIOError $ do
++    throw $ userError "FOO BAR"
++    True <$ readCreateProcess
++      (proc agda agdaArgs)
+         { delegate_ctlc = True
+                           -- Make Agda look for data files in a
+                           -- certain place.
+-        , env           = Just (("Agda_datadir", ddir) : env)
++        , env           = Just ((agdaDirEnvVar, ddir) : env)
+         }
+       (unlines loadBuiltinCmds)
+-  return ()
++
+ 
+ agdaExeExtension :: String
+ agdaExeExtension = exeExtension buildPlatform
